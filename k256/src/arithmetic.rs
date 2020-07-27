@@ -9,7 +9,7 @@ use core::convert::TryInto;
 use core::ops::{Add, AddAssign, Neg, Sub, SubAssign};
 use elliptic_curve::{
     subtle::{Choice, ConditionallySelectable, ConstantTimeEq, CtOption},
-    weierstrass::FixedBaseScalarMul,
+    weierstrass::{curve::Arithmetic, FixedBaseScalarMul},
 };
 
 use crate::{CompressedPoint, PublicKey, ScalarBytes, Secp256k1, UncompressedPoint};
@@ -43,6 +43,11 @@ const ENDOMORPHISM_BETA: FieldElement = FieldElement::from_bytes_unchecked(&[
     0x9c, 0xf0, 0x49, 0x75, 0x12, 0xf5, 0x89, 0x95,
     0xc1, 0x39, 0x6c, 0x28, 0x71, 0x95, 0x01, 0xee,
 ]);
+
+impl Arithmetic for Secp256k1 {
+    type Scalar = Scalar;
+    type AffinePoint = AffinePoint;
+}
 
 /// A point on the secp256k1 curve in affine coordinates.
 #[derive(Clone, Copy, Debug)]
@@ -98,64 +103,69 @@ impl AffinePoint {
         }
     }
 
-    /// Attempts to parse the given [`PublicKey`] as an SEC-1-encoded `AffinePoint`.
+    /// Attempts to parse the given [`PublicKey`] as an SEC-1-encoded [`AffinePoint`].
     ///
     /// # Returns
     ///
     /// `None` value if `pubkey` is not on the secp256k1 curve.
     pub fn from_pubkey(pubkey: &PublicKey) -> CtOption<Self> {
         match pubkey {
-            PublicKey::Compressed(point) => {
-                let bytes = point.as_bytes();
-
-                let y_is_odd = Choice::from(bytes[0] & 0x01);
-                let x = FieldElement::from_bytes(bytes[1..33].try_into().unwrap());
-
-                x.and_then(|x| {
-                    let alpha = (x * &x * &x) + &CURVE_EQUATION_B;
-                    let beta = alpha.sqrt();
-
-                    beta.map(|beta| {
-                        let y = FieldElement::conditional_select(
-                            &beta.negate(1),
-                            &beta,
-                            // beta.is_odd() == y_is_odd
-                            !(beta.normalize().is_odd() ^ y_is_odd),
-                        );
-
-                        AffinePoint {
-                            x,
-                            y: y.normalize(),
-                        }
-                    })
-                })
-            }
-            PublicKey::Uncompressed(point) => {
-                let bytes = point.as_bytes();
-
-                let x = FieldElement::from_bytes(bytes[1..33].try_into().unwrap());
-                let y = FieldElement::from_bytes(bytes[33..65].try_into().unwrap());
-
-                x.and_then(|x| {
-                    y.and_then(|y| {
-                        // Check that the point is on the curve
-                        let lhs = (y * &y).negate(1);
-                        let rhs = x * &x * &x + &CURVE_EQUATION_B;
-                        CtOption::new(AffinePoint { x, y }, (lhs + &rhs).normalizes_to_zero())
-                    })
-                })
-            }
+            PublicKey::Compressed(point) => Self::from_compressed_point(point),
+            PublicKey::Uncompressed(point) => Self::from_uncompressed_point(point),
         }
     }
 
-    /// Returns a [`PublicKey`] with the SEC-1 compressed encoding of this point.
-    pub fn to_compressed_pubkey(&self) -> PublicKey {
-        PublicKey::Compressed(self.clone().into())
+    /// Attempts to parse the given [`CompressedPoint`] as a SEC-1 encoded [`AffinePoint`]
+    pub fn from_compressed_point(point: &CompressedPoint) -> CtOption<Self> {
+        let bytes = point.as_bytes();
+        let y_is_odd = Choice::from(bytes[0] & 0x01);
+        let x = FieldElement::from_bytes(bytes[1..33].try_into().unwrap());
+
+        x.and_then(|x| {
+            let alpha = (x * &x * &x) + &CURVE_EQUATION_B;
+            let beta = alpha.sqrt();
+
+            beta.map(|beta| {
+                let y = FieldElement::conditional_select(
+                    &beta.negate(1),
+                    &beta,
+                    // beta.is_odd() == y_is_odd
+                    !(beta.normalize().is_odd() ^ y_is_odd),
+                );
+
+                AffinePoint {
+                    x,
+                    y: y.normalize(),
+                }
+            })
+        })
     }
 
-    /// Returns a [`PublicKey`] with the SEC-1 uncompressed encoding of this point.
-    pub fn to_uncompressed_pubkey(&self) -> PublicKey {
-        PublicKey::Uncompressed(self.clone().into())
+    /// Attempts to parse the given [`UncompressedPoint`] as a SEC-1 encoded [`AffinePoint`]
+    pub fn from_uncompressed_point(point: &UncompressedPoint) -> CtOption<Self> {
+        let bytes = point.as_bytes();
+        let x = FieldElement::from_bytes(bytes[1..33].try_into().unwrap());
+        let y = FieldElement::from_bytes(bytes[33..65].try_into().unwrap());
+
+        x.and_then(|x| {
+            y.and_then(|y| {
+                // Check that the point is on the curve
+                let lhs = (y * &y).negate(1);
+                let rhs = x * &x * &x + &CURVE_EQUATION_B;
+                CtOption::new(AffinePoint { x, y }, (lhs + &rhs).normalizes_to_zero())
+            })
+        })
+    }
+
+    /// Returns a [`PublicKey`] with the SEC-1 encoding of this point.
+    ///
+    /// If `compress` is set to `true`, point compression is applied.
+    pub fn to_pubkey(&self, compress: bool) -> PublicKey {
+        if compress {
+            PublicKey::Compressed(self.clone().into())
+        } else {
+            PublicKey::Uncompressed(self.clone().into())
+        }
     }
 }
 
@@ -186,8 +196,7 @@ impl FixedBaseScalarMul for Secp256k1 {
     /// Multiply the given scalar by the generator point for this elliptic
     /// curve.
     fn mul_base(scalar_bytes: &ScalarBytes) -> CtOption<Self::Point> {
-        let bytes: [u8; 32] = (*scalar_bytes).into();
-        Scalar::from_bytes(&bytes)
+        Scalar::from_bytes(scalar_bytes.as_ref())
             .and_then(|scalar| (&ProjectivePoint::generator() * &scalar).to_affine())
     }
 }
@@ -571,7 +580,7 @@ mod tests {
         let pubkey = PublicKey::from_bytes(&hex::decode(UNCOMPRESSED_BASEPOINT).unwrap()).unwrap();
         let res: PublicKey = AffinePoint::from_pubkey(&pubkey)
             .unwrap()
-            .to_uncompressed_pubkey()
+            .to_pubkey(false)
             .into();
 
         assert_eq!(res, pubkey);
@@ -582,7 +591,7 @@ mod tests {
         let pubkey = PublicKey::from_bytes(&hex::decode(COMPRESSED_BASEPOINT).unwrap()).unwrap();
         let res: PublicKey = AffinePoint::from_pubkey(&pubkey)
             .unwrap()
-            .to_compressed_pubkey()
+            .to_pubkey(true)
             .into();
 
         assert_eq!(res, pubkey);
@@ -592,9 +601,7 @@ mod tests {
     fn uncompressed_to_compressed() {
         let encoded = PublicKey::from_bytes(&hex::decode(UNCOMPRESSED_BASEPOINT).unwrap()).unwrap();
 
-        let res = AffinePoint::from_pubkey(&encoded)
-            .unwrap()
-            .to_compressed_pubkey();
+        let res = AffinePoint::from_pubkey(&encoded).unwrap().to_pubkey(true);
 
         assert_eq!(
             hex::encode(res.as_bytes()).to_uppercase(),
@@ -606,9 +613,7 @@ mod tests {
     fn compressed_to_uncompressed() {
         let encoded = PublicKey::from_bytes(&hex::decode(COMPRESSED_BASEPOINT).unwrap()).unwrap();
 
-        let res = AffinePoint::from_pubkey(&encoded)
-            .unwrap()
-            .to_uncompressed_pubkey();
+        let res = AffinePoint::from_pubkey(&encoded).unwrap().to_pubkey(false);
 
         assert_eq!(
             hex::encode(res.as_bytes()).to_uppercase(),
